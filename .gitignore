@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+specmash_email_draft.html
+local_service_settings.json
+specmash_email_exact.eml
+build_eml.py
+send_eml.py
