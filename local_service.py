@@ -208,18 +208,31 @@ class Handler(BaseHTTPRequestHandler):
                             raise RuntimeError("Сервер отклонил адрес получателя")
                 except smtplib.SMTPAuthenticationError:
                     error = "Яндекс отклонил пароль приложения"
-                    record_attempt(html, recipient, subject, "error", error)
+                    try:
+                        record_attempt(html, recipient, subject, "error", error)
+                    except OSError:
+                        pass
                     return self._json(401, {"error": error})
                 except smtplib.SMTPDataError as error:
                     detail = f"Яндекс не принял письмо: {error.smtp_code} {error.smtp_error.decode('utf-8', 'replace')[:180]}"
-                    record_attempt(html, recipient, subject, "error", detail)
+                    try:
+                        record_attempt(html, recipient, subject, "error", detail)
+                    except OSError:
+                        pass
                     return self._json(502, {"error": detail})
                 except (smtplib.SMTPException, OSError, RuntimeError) as error:
                     detail = f"Ошибка SMTP: {type(error).__name__}. Проверьте сеть и попробуйте позже."
-                    record_attempt(html, recipient, subject, "error", detail)
+                    try:
+                        record_attempt(html, recipient, subject, "error", detail)
+                    except OSError:
+                        pass
                     return self._json(502, {"error": detail})
-                entry = record_attempt(html, recipient, subject, "accepted", "Яндекс принял письмо", str(message["Message-ID"]))
-                return self._json(200, {"ok": True, "recipient": recipient, "messageId": str(message["Message-ID"]), "historyId": entry["id"]})
+                try:
+                    entry = record_attempt(html, recipient, subject, "accepted", "Яндекс принял письмо", str(message["Message-ID"]))
+                    history_id = entry["id"]
+                except OSError:
+                    history_id = None
+                return self._json(200, {"ok": True, "recipient": recipient, "messageId": str(message["Message-ID"]), "historyId": history_id})
 
             return self._json(404, {"error": "Не найдено"})
         except (ValueError, json.JSONDecodeError) as error:

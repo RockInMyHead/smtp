@@ -311,7 +311,8 @@
       setBusy(true); status('Передаю письмо Яндексу. Это может занять до минуты…');
       try {
         const result=await api('/api/send',{...payload(),recipient});
-        status(`Яндекс принял письмо для ${result.recipient}. ID: ${result.messageId}`,'ok');
+        status(`Яндекс принял письмо для ${result.recipient}. ID: ${result.messageId}` +
+          (result.historyId ? '' : '\nНе удалось сохранить запись в локальной истории.'),'ok');
       } catch(error) { status(error.message,'error'); }
       finally { setBusy(false); await refreshState().catch(() => {}); }
     });
