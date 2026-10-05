@@ -3,12 +3,16 @@
 from email.utils import parseaddr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from datetime import datetime, timezone
 import json
+import os
 import re
 import secrets
 import smtplib
 import ssl
+import subprocess
 import sys
+import threading
 import webbrowser
 
 import certifi
@@ -20,16 +24,75 @@ ROOT = Path(__file__).resolve().parent
 ORIGINAL = ROOT / "specmash_email_final.html"
 DRAFT = ROOT / "specmash_email_draft.html"
 SETTINGS = ROOT / "local_service_settings.json"
+HISTORY = ROOT / "local_history"
+HISTORY_INDEX = HISTORY / "index.json"
+KEYCHAIN_SERVICE = "openfactory-local-smtp-editor"
+SENDER = "news@open-factory.ru"
+HISTORY_LOCK = threading.Lock()
 PORT = 8765
 TOKEN = secrets.token_urlsafe(32)
 DEFAULT_SUBJECT = "OpenFactory для «Спецмаш»: склад в 3D и движение каждой детали"
 MAX_BODY = 15 * 1024 * 1024
 
 
+def keychain_password():
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", SENDER, "-w"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def save_keychain_password(password):
+    if not password or not password.isascii() or "\n" in password or "\r" in password:
+        raise ValueError("Пароль должен содержать только латинские символы без переноса строки")
+    result = subprocess.run(
+        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+         "-a", SENDER, "-l", "OpenFactory — пароль приложения Яндекс Почты", "-w"],
+        input=password + "\n" + password + "\n", capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Не удалось сохранить пароль в Связке ключей macOS")
+
+
+def delete_keychain_password():
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", SENDER],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode not in (0, 44):
+        raise RuntimeError("Не удалось удалить пароль из Связки ключей macOS")
+
+
+def history_entries():
+    return json.loads(HISTORY_INDEX.read_text(encoding="utf-8")) if HISTORY_INDEX.exists() else []
+
+
+def record_attempt(html, recipient, subject, result, detail, message_id=None):
+    entry_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(4)
+    entry = {
+        "id": entry_id, "date": datetime.now(timezone.utc).isoformat(),
+        "recipient": recipient, "subject": subject, "result": result,
+        "detail": detail, "messageId": message_id,
+    }
+    with HISTORY_LOCK:
+        HISTORY.mkdir(mode=0o700, exist_ok=True)
+        path = HISTORY / f"{entry_id}.html"
+        path.write_text(html, encoding="utf-8")
+        os.chmod(path, 0o600)
+        entries = history_entries()
+        entries.insert(0, entry)
+        temporary = HISTORY / "index.tmp"
+        temporary.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(HISTORY_INDEX)
+    return entry
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Never log request bodies or the app password.
-        if self.path == "/api/send":
+        if self.path in {"/api/send", "/api/password", "/api/password/delete"}:
             return
         super().log_message(format, *args)
 
@@ -73,6 +136,14 @@ class Handler(BaseHTTPRequestHandler):
                 "subject": settings.get("subject", DEFAULT_SUBJECT),
                 "isDraft": DRAFT.exists(),
             })
+        elif self.path == "/api/state":
+            self._json(200, {"passwordSaved": keychain_password() is not None, "history": history_entries()})
+        elif self.path.startswith("/api/history/"):
+            entry_id = self.path.removeprefix("/api/history/")
+            entry = next((item for item in history_entries() if item["id"] == entry_id), None)
+            if not entry:
+                return self._json(404, {"error": "Запись истории не найдена"})
+            self._json(200, {**entry, "html": (HISTORY / f"{entry_id}.html").read_text(encoding="utf-8")})
         else:
             self._json(404, {"error": "Не найдено"})
 
@@ -80,6 +151,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_host() or not self._valid_write():
             return self._json(403, {"error": "Недопустимый запрос"})
         try:
+            if self.path in {"/api/password", "/api/password/delete"}:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    return self._json(413, {"error": "Недопустимый размер запроса"})
+                data = json.loads(self.rfile.read(length))
+                if self.path == "/api/password/delete":
+                    delete_keychain_password()
+                    return self._json(200, {"passwordSaved": False})
+                password = data.get("password")
+                if not isinstance(password, str):
+                    raise ValueError("Введите пароль приложения Яндекса")
+                save_keychain_password(password)
+                return self._json(200, {"passwordSaved": True})
             if self.path == "/api/reset":
                 DRAFT.unlink(missing_ok=True)
                 SETTINGS.unlink(missing_ok=True)
@@ -107,34 +191,41 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/api/send":
                 recipient = data.get("recipient", "")
-                password = data.get("password", "")
                 if not isinstance(recipient, str) or len(recipient) > 254 or not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", recipient):
                     raise ValueError("Укажите один корректный адрес получателя")
                 if parseaddr(recipient)[1] != recipient:
                     raise ValueError("Некорректный адрес получателя")
-                if not isinstance(password, str) or not password:
-                    raise ValueError("Введите пароль приложения Яндекса")
-                if not password.isascii():
-                    raise ValueError("Пароль приложения содержит нелатинские символы. Вставьте его заново латиницей из Яндекса.")
+                password = keychain_password()
+                if not password:
+                    raise ValueError("Сначала сохраните пароль приложения Яндекса")
                 message = build_message(html, recipient, subject)
                 context = ssl.create_default_context(cafile=certifi.where())
                 try:
                     with smtplib.SMTP_SSL("smtp.yandex.ru", 465, context=context, timeout=45) as smtp:
-                        smtp.login("news@open-factory.ru", password)
-                        refused = smtp.send_message(message, from_addr="news@open-factory.ru", to_addrs=[recipient])
+                        smtp.login(SENDER, password)
+                        refused = smtp.send_message(message, from_addr=SENDER, to_addrs=[recipient])
                         if refused:
                             raise RuntimeError("Сервер отклонил адрес получателя")
                 except smtplib.SMTPAuthenticationError:
-                    return self._json(401, {"error": "Яндекс отклонил пароль приложения"})
+                    error = "Яндекс отклонил пароль приложения"
+                    record_attempt(html, recipient, subject, "error", error)
+                    return self._json(401, {"error": error})
                 except smtplib.SMTPDataError as error:
-                    return self._json(502, {"error": f"Яндекс не принял письмо: {error.smtp_code} {error.smtp_error.decode('utf-8', 'replace')[:180]}"})
-                except (smtplib.SMTPException, OSError) as error:
-                    return self._json(502, {"error": f"Ошибка SMTP: {type(error).__name__}. Проверьте сеть и попробуйте позже."})
-                return self._json(200, {"ok": True, "recipient": recipient, "messageId": str(message["Message-ID"])})
+                    detail = f"Яндекс не принял письмо: {error.smtp_code} {error.smtp_error.decode('utf-8', 'replace')[:180]}"
+                    record_attempt(html, recipient, subject, "error", detail)
+                    return self._json(502, {"error": detail})
+                except (smtplib.SMTPException, OSError, RuntimeError) as error:
+                    detail = f"Ошибка SMTP: {type(error).__name__}. Проверьте сеть и попробуйте позже."
+                    record_attempt(html, recipient, subject, "error", detail)
+                    return self._json(502, {"error": detail})
+                entry = record_attempt(html, recipient, subject, "accepted", "Яндекс принял письмо", str(message["Message-ID"]))
+                return self._json(200, {"ok": True, "recipient": recipient, "messageId": str(message["Message-ID"]), "historyId": entry["id"]})
 
             return self._json(404, {"error": "Не найдено"})
         except (ValueError, json.JSONDecodeError) as error:
             return self._json(400, {"error": str(error)})
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return self._json(500, {"error": "Не удалось открыть Связку ключей или сохранить историю"})
 
 
 if __name__ == "__main__":

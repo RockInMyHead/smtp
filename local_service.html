@@ -46,6 +46,14 @@
     .status.ok{display:block;background:#e8f8ef;color:#117247;border:1px solid #b8e8ca}
     .status.error{display:block;background:#fff0f0;color:#b43a3a;border:1px solid #f3c5c5}
     .status.info{display:block;background:#ecf5ff;color:#315b89;border:1px solid #cfe5fa}
+    .credential-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .credential-row .field-note{margin:0;flex:1}
+    .history-title{font-size:16px;font-weight:800;color:#174778;margin:26px 0 5px}
+    .history-list{display:grid;gap:9px;max-height:320px;overflow:auto;margin-top:12px}
+    .history-item{border:1px solid #dce8f4;background:#f8fbff;border-radius:10px;padding:11px;font-size:12px;line-height:1.45}
+    .history-item strong{display:block;font-size:13px;overflow-wrap:anywhere;margin:3px 0}
+    .history-item .ok-text{color:#138251}.history-item .error-text{color:#ba3838}
+    .history-item button{margin-top:7px}
     .preview{min-width:0;overflow:hidden;display:flex;flex-direction:column}
     .preview-head{height:62px;padding:0 20px;border-bottom:1px solid #e7eef6;display:flex;justify-content:space-between;align-items:center;gap:12px}
     .preview-head b{color:#153f6a}
@@ -75,8 +83,9 @@
       <label for="subject">Тема</label>
       <input id="subject" type="text" maxlength="200">
       <label for="password">Пароль приложения Яндекса</label>
-      <input id="password" type="password" autocomplete="off" placeholder="Введите перед отправкой">
-      <div class="field-note">Для адреса news@open-factory.ru. Пароль остаётся только в памяти браузера до отправки.</div>
+      <input id="password" type="password" autocomplete="new-password" placeholder="Введите пароль для сохранения">
+      <div class="credential-row"><div id="passwordState" class="field-note">Проверяем Связку ключей…</div><button id="forgetPassword" class="small" type="button" hidden>Удалить пароль</button></div>
+      <div class="field-note">Пароль для news@open-factory.ru автоматически сохраняется в Связке ключей macOS после ввода. Он не записывается в проект и не показывается в браузере.</div>
 
       <div class="line"></div>
       <label class="toggle"><input id="editMode" type="checkbox"> Редактировать текст в письме</label>
@@ -95,6 +104,9 @@
 
       <div class="actions"><button id="saveButton" class="secondary" type="button">Сохранить</button><button id="sendButton" class="primary" type="button">Отправить письмо</button></div>
       <div id="status" class="status" role="status"></div>
+      <div class="history-title">История отправки</div>
+      <div class="field-note">Здесь записаны попытки из этого редактора. Статус «Принято Яндексом» не подтверждает доставку адресату.</div>
+      <div id="historyList" class="history-list"></div>
     </section>
     <section class="preview">
       <div class="preview-head"><b>Предпросмотр</b><span id="draftState">Загружаем шаблон…</span></div>
@@ -114,6 +126,8 @@
     let currentHtml = '';
     let selectedImage = null;
     let busy = false;
+    let passwordSaved = false;
+    let passwordSavePromise = Promise.resolve();
 
     function status(message, kind='info') {
       const box = $('status'); box.textContent = message; box.className = 'status ' + kind;
@@ -172,12 +186,62 @@
     }
     function payload() { capture(); return {html:currentHtml,subject:$('subject').value.trim()}; }
     function setBusy(value) { busy=value; $('saveButton').disabled=value; $('sendButton').disabled=value; }
+    function showPasswordState() {
+      $('passwordState').textContent = passwordSaved ? 'Пароль сохранён в Связке ключей macOS' : 'Пароль ещё не сохранён';
+      $('forgetPassword').hidden = !passwordSaved;
+      $('password').placeholder = passwordSaved ? 'Введите новый пароль, чтобы заменить сохранённый' : 'Введите пароль для сохранения';
+    }
+    async function saveEnteredPassword() {
+      const password = $('password').value;
+      if (!password) return;
+      if (!/^[\x00-\x7F]+$/.test(password)) throw new Error('Пароль содержит нелатинские символы. Проверьте раскладку.');
+      await api('/api/password', {password});
+      $('password').value = '';
+      passwordSaved = true;
+      showPasswordState();
+      status('Пароль сохранён в Связке ключей macOS.','ok');
+    }
+    function renderHistory(entries) {
+      const list = $('historyList'); list.replaceChildren();
+      if (!entries.length) { const empty=document.createElement('div'); empty.className='field-note'; empty.textContent='Отправок пока нет.'; list.append(empty); return; }
+      entries.forEach(entry => {
+        const item=document.createElement('div'); item.className='history-item';
+        const date=document.createElement('span'); date.textContent=new Date(entry.date).toLocaleString('ru-RU');
+        const title=document.createElement('strong'); title.textContent=entry.recipient + ' · ' + entry.subject;
+        const result=document.createElement('div'); result.className=entry.result==='accepted'?'ok-text':'error-text';
+        result.textContent=(entry.result==='accepted'?'Принято Яндексом':'Ошибка отправки') + (entry.result==='accepted'?'':' · '+entry.detail);
+        const button=document.createElement('button'); button.className='small'; button.type='button'; button.textContent='Открыть письмо';
+        button.addEventListener('click', async () => {
+          if ($('draftState').textContent==='Есть несохранённые изменения' && !confirm('Открыть письмо из истории? Несохранённые правки будут потеряны.')) return;
+          try {
+            const response=await fetch('/api/history/'+encodeURIComponent(entry.id)); const data=await response.json();
+            if (!response.ok) throw new Error(data.error || 'Не удалось открыть письмо');
+            $('recipient').value=data.recipient; $('subject').value=data.subject; render(data.html); dirty();
+            status('Письмо из истории открыто для просмотра и редактирования.','info');
+          } catch(error) { status(error.message,'error'); }
+        });
+        item.append(date,title,result,button); list.append(item);
+      });
+    }
+    async function refreshState() {
+      const response=await fetch('/api/state'); const data=await response.json();
+      if (!response.ok) throw new Error(data.error || 'Не удалось загрузить состояние редактора');
+      passwordSaved=data.passwordSaved; showPasswordState(); renderHistory(data.history);
+    }
 
     $('editMode').addEventListener('change', () => {
       const doc = $('letter').contentDocument;
       if (doc?.body) doc.body.contentEditable = $('editMode').checked ? 'true' : 'false';
     });
     $('subject').addEventListener('input', dirty);
+    $('password').addEventListener('change', () => {
+      passwordSavePromise = saveEnteredPassword().catch(error => status(error.message,'error'));
+    });
+    $('forgetPassword').addEventListener('click', async () => {
+      if (!confirm('Удалить пароль приложения из Связки ключей macOS?')) return;
+      try { await api('/api/password/delete', {}); passwordSaved=false; showPasswordState(); status('Сохранённый пароль удалён.','ok'); }
+      catch(error) { status(error.message,'error'); }
+    });
     $('imageFile').addEventListener('change', event => {
       const file = event.target.files[0]; if (!file || !selectedImage) return;
       if (!['image/png','image/jpeg','image/gif'].includes(file.type)) { status('Используйте PNG, JPEG или GIF','error'); return; }
@@ -240,21 +304,23 @@
       if (busy) return;
       const recipient=$('recipient').value.trim();
       if (!$('recipient').checkValidity() || !recipient) { status('Введите корректный адрес получателя.','error'); $('recipient').focus(); return; }
-      if (!$('password').value) { status('Введите пароль приложения Яндекса.','error'); $('password').focus(); return; }
-      if (!/^[\x00-\x7F]+$/.test($('password').value)) { status('Пароль содержит нелатинские символы. Проверьте раскладку и вставьте пароль приложения из Яндекса заново.','error'); $('password').focus(); return; }
+      try { await passwordSavePromise; await saveEnteredPassword(); }
+      catch(error) { status(error.message,'error'); $('password').focus(); return; }
+      if (!passwordSaved) { status('Введите пароль приложения Яндекса.','error'); $('password').focus(); return; }
       if (!confirm(`Отправить письмо с адреса news@open-factory.ru получателю ${recipient}?`)) return;
       setBusy(true); status('Передаю письмо Яндексу. Это может занять до минуты…');
       try {
-        const result=await api('/api/send',{...payload(),recipient,password:$('password').value});
-        $('password').value=''; status(`Яндекс принял письмо для ${result.recipient}. ID: ${result.messageId}`,'ok');
+        const result=await api('/api/send',{...payload(),recipient});
+        status(`Яндекс принял письмо для ${result.recipient}. ID: ${result.messageId}`,'ok');
       } catch(error) { status(error.message,'error'); }
-      finally { $('password').value=''; setBusy(false); }
+      finally { setBusy(false); await refreshState().catch(() => {}); }
     });
 
     fetch('/api/template').then(r=>r.json()).then(data=>{
       $('subject').value=data.subject; render(data.html);
       $('draftState').textContent=data.isDraft?'Сохранённый шаблон':'Исходный шаблон';
     }).catch(error=>status('Не удалось загрузить шаблон: '+error.message,'error'));
+    refreshState().catch(error=>status('Не удалось загрузить историю: '+error.message,'error'));
   </script>
 </body>
 </html>
